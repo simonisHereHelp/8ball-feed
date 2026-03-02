@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 import { fetchRss } from "../../../lib/rss";
 import { formatLine, stripHtml } from "../../../lib/format";
 import { summarizeWithOpenAI } from "../../../lib/openai";
+import { mapWithConcurrency } from "../../../lib/rate-limit";
 
 export const runtime = "nodejs";
 
@@ -45,8 +46,9 @@ export async function GET(req: Request) {
     .sort((a, b) => (b.date ?? "").localeCompare(a.date ?? ""))
     .slice(0, limit);
 
-  const enriched = await Promise.all(
-    deduped.map(async (it) => {
+  const enriched = await mapWithConcurrency(
+    deduped,
+    async (it) => {
       const cleaned = stripHtml(it.snippet);
       const ai = await summarizeWithOpenAI(`${it.title}\n\n${cleaned}\n\n${it.url}`);
       const summary = ai ?? cleaned;
@@ -62,7 +64,8 @@ export async function GET(req: Request) {
           url: it.url,
         }),
       };
-    })
+    },
+    2
   );
 
   return NextResponse.json({ sources: FEEDS, count: enriched.length, feed: enriched });

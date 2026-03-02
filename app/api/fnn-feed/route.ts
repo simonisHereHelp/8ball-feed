@@ -5,6 +5,7 @@ import { z } from "zod";
 
 import { formatLine } from "../../../lib/format";
 import { summarizeWithOpenAI } from "../../../lib/openai";
+import { mapWithConcurrency, sleep } from "../../../lib/rate-limit";
 
 export const runtime = "nodejs";
 
@@ -27,6 +28,29 @@ function ymd(d: Date) {
   const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
   const dd = String(d.getUTCDate()).padStart(2, "0");
   return `${yyyy}-${mm}-${dd}`;
+}
+
+async function fetchFinnhubNews(url: string) {
+  const maxRetries = 2;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    const response = await fetch(url, { cache: "no-store" });
+    if (response.ok) {
+      return response.json() as Promise<FinnhubItem[]>;
+    }
+
+    const body = (await response.text()).slice(0, 200);
+    if ((response.status === 429 || response.status === 403) && attempt < maxRetries) {
+      const retryAfter = Number(response.headers.get("retry-after") ?? "0");
+      const waitMs = retryAfter > 0 ? retryAfter * 1000 : (attempt + 1) * 1200;
+      await sleep(waitMs);
+      continue;
+    }
+
+    throw new Error(`Finnhub HTTP ${response.status}: ${body}`);
+  }
+
+  return [];
 }
 
 export async function GET(req: Request) {
@@ -65,56 +89,55 @@ export async function GET(req: Request) {
     error?: string;
   }> = [];
 
-  await Promise.all(
-    symbols.map(async (sym) => {
-      try {
-        const url = new URL("https://finnhub.io/api/v1/company-news");
-        url.searchParams.set("symbol", sym);
-        url.searchParams.set("from", fromStr);
-        url.searchParams.set("to", toStr);
-        url.searchParams.set("token", apiKey);
+  for (const sym of symbols) {
+    try {
+      const url = new URL("https://finnhub.io/api/v1/company-news");
+      url.searchParams.set("symbol", sym);
+      url.searchParams.set("from", fromStr);
+      url.searchParams.set("to", toStr);
+      url.searchParams.set("token", apiKey);
 
-        const r = await fetch(url.toString(), { cache: "no-store" });
-        if (!r.ok) throw new Error(`Finnhub HTTP ${r.status}: ${(await r.text()).slice(0, 200)}`);
+      const data = await fetchFinnhubNews(url.toString());
 
-        const data = (await r.json()) as FinnhubItem[];
+      const trimmed = data.slice(0, limit).map((it) => {
+        const dt = it.datetime ? new Date(it.datetime * 1000) : null;
+        return {
+          title: it.headline ?? "(no headline)",
+          date: dt ? dt.toISOString() : null,
+          url: it.url ?? "",
+          summary: it.summary ?? "",
+          source: it.source ?? "Finnhub",
+        };
+      });
 
-        const trimmed = data.slice(0, limit).map((it) => {
-          const dt = it.datetime ? new Date(it.datetime * 1000) : null;
+      const enriched = await mapWithConcurrency(
+        trimmed,
+        async (it) => {
+          const ai = await summarizeWithOpenAI(`${it.title}\n\n${it.summary}\n\n${it.url}`);
+          const summary = ai ?? it.summary;
+
           return {
-            title: it.headline ?? "(no headline)",
-            date: dt ? dt.toISOString() : null,
-            url: it.url ?? "",
-            summary: it.summary ?? "",
-            source: it.source ?? "Finnhub",
-          };
-        });
-
-        const enriched = await Promise.all(
-          trimmed.map(async (it) => {
-            const ai = await summarizeWithOpenAI(`${it.title}\n\n${it.summary}\n\n${it.url}`);
-            const summary = ai ?? it.summary;
-
-            return {
-              ...it,
+            ...it,
+            summary,
+            formatted: formatLine({
+              title: it.title,
+              date: it.date ? new Date(it.date) : null,
+              tzLabel: "UTC",
               summary,
-              formatted: formatLine({
-                title: it.title,
-                date: it.date ? new Date(it.date) : null,
-                tzLabel: "UTC",
-                summary,
-                url: it.url,
-              }),
-            };
-          })
-        );
+              url: it.url,
+            }),
+          };
+        },
+        2
+      );
 
-        results.push({ tricker: sym, items: enriched });
-      } catch (e: any) {
-        results.push({ tricker: sym, items: [], error: e?.message ?? "Unknown error" });
-      }
-    })
-  );
+      results.push({ tricker: sym, items: enriched });
+    } catch (e: any) {
+      results.push({ tricker: sym, items: [], error: e?.message ?? "Unknown error" });
+    }
+
+    await sleep(1100);
+  }
 
   const feed = results
     .flatMap((r) => r.items.map((it) => ({ tricker: r.tricker, ...it })))

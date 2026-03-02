@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 import { fetchRss } from "../../../lib/rss";
 import { formatLine, stripHtml } from "../../../lib/format";
 import { summarizeWithOpenAI } from "../../../lib/openai";
+import { mapWithConcurrency } from "../../../lib/rate-limit";
 
 export const runtime = "nodejs";
 
@@ -16,14 +17,30 @@ const FEEDS = [
   "https://www.verdict.co.uk/medical-devices/feed/",
 ];
 
+function pushDebug(debug: string[], enabled: boolean, message: string) {
+  if (!enabled) return;
+  const line = `[fda-feed] ${message}`;
+  debug.push(line);
+  console.log(line);
+}
+
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const limit = Number(searchParams.get("limit") ?? "80");
+  const debugEnabled = searchParams.get("debug") === "1";
+  const debug: string[] = [];
+
+  pushDebug(debug, debugEnabled, `start feeds=${FEEDS.length} limit=${limit}`);
 
   const fetched = await Promise.allSettled(FEEDS.map((u) => fetchRss(u)));
 
   const items = fetched.flatMap((res, i) => {
-    if (res.status !== "fulfilled") return [];
+    if (res.status !== "fulfilled") {
+      pushDebug(debug, debugEnabled, `feed=${FEEDS[i]} status=rejected`);
+      return [];
+    }
+
+    pushDebug(debug, debugEnabled, `feed=${FEEDS[i]} status=fulfilled items=${res.value.length}`);
     return res.value.map((it) => ({
       feedUrl: FEEDS[i],
       source: it.sourceTitle ?? FEEDS[i],
@@ -34,7 +51,6 @@ export async function GET(req: Request) {
     }));
   });
 
-  // dedupe by URL
   const byUrl = new Map<string, any>();
   for (const it of items) {
     if (!it.url) continue;
@@ -45,11 +61,18 @@ export async function GET(req: Request) {
     .sort((a, b) => (b.date ?? "").localeCompare(a.date ?? ""))
     .slice(0, limit);
 
-  const enriched = await Promise.all(
-    deduped.map(async (it) => {
+  pushDebug(debug, debugEnabled, `deduped=${deduped.length}`);
+
+  const enriched = await mapWithConcurrency(
+    deduped,
+    async (it, index) => {
       const cleaned = stripHtml(it.snippet);
       const ai = await summarizeWithOpenAI(`${it.title}\n\n${cleaned}\n\n${it.url}`);
       const summary = ai ?? cleaned;
+
+      if (index < 5) {
+        pushDebug(debug, debugEnabled, `summarized index=${index} aiUsed=${Boolean(ai)}`);
+      }
 
       return {
         ...it,
@@ -62,8 +85,11 @@ export async function GET(req: Request) {
           url: it.url,
         }),
       };
-    })
+    },
+    2
   );
 
-  return NextResponse.json({ sources: FEEDS, count: enriched.length, feed: enriched });
+  pushDebug(debug, debugEnabled, `finish enriched=${enriched.length}`);
+
+  return NextResponse.json({ sources: FEEDS, count: enriched.length, feed: enriched, debug: debugEnabled ? debug : undefined });
 }
